@@ -1,0 +1,751 @@
+# -*- encoding: utf-8 -*-
+import requests
+import re
+import os
+import time
+import Itool
+import raven
+import json
+import logging
+import threading
+import socket
+
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine, text, desc, func
+from sqlalchemy.orm import sessionmaker
+from models import BulletinSearchDomainResult
+from urllib.parse import urlparse, urlunparse, urljoin, quote, unquote
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+logging.info(os.getenv('MASTERDB01'))
+logging.warning(os.getenv('SENTRY_SDN_EXT'))
+SENTRY_SDN = None
+if SENTRY_SDN:
+    raven_client = raven.Client(SENTRY_SDN)
+else:
+    raven_client = None
+
+
+def ip_to_host(addr):
+
+    try:
+        host = socket.gethostbyaddr(addr)
+    except Exception as e:
+        host = ''
+
+    return host
+
+def url_to_ip(url):
+    url, port = get_url_domain(url)
+    try:
+        ip = socket.gethostbyname(url)
+    except Exception as e:
+        ip = ''
+
+    return ip, port
+
+
+def get_url_schema(url):
+    """传入网址获取相应域名"""
+    arr = urlparse(url)
+    if not arr.netloc:
+        return ''
+    text = arr.scheme + '://' + arr.netloc
+    return text
+
+
+def get_url_domain(url):
+    """
+    清洗出传入网址的域名
+    :param url:
+    :return:
+    """
+    if 'http' not in url[:4]:
+        url = 'http://' + url
+    arr = urlparse(url)
+    if not arr.netloc:
+        return '', ''
+
+    if not arr.port:
+        return arr.netloc, ''
+
+    return arr._hostinfo
+
+
+def request(url=None,
+            method='get',
+            headers=None,
+            continue_code=[],
+            retries=3,
+            timeout=10,
+            **kwargs):
+    """
+
+    :param url:
+    :param method:
+    :param headers:
+    :param continue_code: 检测状态码是否继续运行 有些网址访问过于频繁 会返回503状态码  第二次继续访问就可正常 如果实现传入状态码list  当检测到指定的状态码会重新进行访问
+    :param retries: 重试次数 默认状态码不等于200 的会进行重试
+
+    :param kwargs:
+    :return:
+    """
+
+    if headers == None:
+        headers = {'Connection': 'keep-alive',
+                   'Cache-Control': 'max-age=0',
+                   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                   'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Maxthon/4.9.1.1000 Chrome/39.0.2146.0 Safari/537.36',
+                   'DNT': '1',
+                   'Accept-Encoding': 'gzip,deflate',
+                   'Accept-Language': 'zh-CN'}
+    for x in range(retries):
+        try:
+            r = requests.request(method=method,
+                                 url=url,
+                                 headers=headers,
+                                 timeout=timeout,
+                                 **kwargs
+                                 )
+            # ISO-8859-1   把这种编码转换成gbk
+            if r.encoding == 'ISO-8859-1':
+                '''防止中文编码的时候乱码'''
+                r.encoding = 'gbk'
+
+            status_code = r.status_code
+
+
+        except Exception as error:
+            r = None
+            status_code = -1
+
+        if status_code == 200 or (status_code >=300 and status_code < 400) or status_code in continue_code:
+            return r
+
+    return None
+
+
+RE_CONTENT = re.compile('tpl="se_com_default"[\s\S]{1,2000}?href = "(.*?)"[\s\S]{1,1000}?>([\s\S]{1,1000}?)</a>([\s\S]{1,4000}?)</div>[\s\S]{1,2000}?class="c-showurl".*?>(.*?)</a>(?:[\s\S]{1,5000}?href="(https?://cache.baiducontent.com.*?)")?')
+RE_CHAR_CHECK = re.compile(r'[\(（]\s?略\s?[）\)]|\*\*|会员可见|登录后查看')  # 检测是否存在** （略）
+RE_MUST_TITLE = re.compile(r'中标|招标|议标|废标|流标|邀标|采购|比选|磋商|竞价|竞投|中选|投标|遴选')
+# 标题必须包含
+RE_FILTER_TITLE = re.compile(r'土地|产权|矿|国土|合同|道客巴巴|-.{1,7}?网$|真人分享|在线论坛')  # 标题中不得包含
+RE_LAST_KEYWORD = re.compile(r'\.conac\.cn|121\.43\.68\.40/exposure')  # 最后是否存在政府找错 企事业单位标识
+
+RE_MUST_URL = re.compile(r'\.gov|\.edu')  # 网址包含gov edu  直接返回
+
+RE_META_FILTER = re.compile(r'欢乐彩|刮刮乐|双色球|福利彩票|财经频道|股票|股票行情|股票软件|股票入门与技巧|炒股|新手炒股|股票开户|基金|期货|理财|财经|外汇|保险|银行|证券|金融|大盘|黄金|白银|行情|财经新闻|装修资讯|福州房产|楼盘详情|买房流程|业主论坛|家居装修|购房平台', flags=re.I)
+
+# 在页面中提取title  并判断是否存在 学院|医院|政府|采购|公共资源
+RE_META_TITLE_c = re.compile(r'学院|医院|政府采购|公共资源')
+# 抽取页面title
+RE_TITLE = re.compile(r'<title>([\s\S]{1,500}?)</title>', flags=re.I)
+
+RE_META_MUST_KEYWORD = re.compile(r'住房|城[乡市]建设|政务公开|信息公开|公告公示|办事服务|工作动态|公众参与|中标|招标|议标|废标|流标|邀标|询价|谈判|磋商|竞价|竞投|中选|投标|遴选|公共资源|政府采购')
+
+RE_CONTENT_KEYWORD = re.compile(r'采购公告|采购结果|招标公告|中标结果|竞价公告|竞价结果')  # 匹配全文是否包含这些关键词
+
+RE_CONTENT_CHECK = re.compile(r'[\(（]\s?略\s?[）\)]|\*\*|会员可见|登录后查看|返回总站')  # 判断为疑似商业站点
+
+RE_CHECK_URL = re.compile(r'''(?:(?:href|src)(?:&quot;|\s)?=(?:&quot;|\s)?(["'])([\s\S]{5,1000}?)\1).*?>([\s\S]{1,1000}?)</a>''', flags=re.I)
+
+black_list = ['qianlima.com', 'bidchance.com', 'baidu.com', 'bidcenter.com', 'zbytb.com', 'okcis.cn', 'gc-zb.com',
+              'chinabidding.com', 'ebnew.com', 'zbwmy.com', 'zhaobiao.cn', 'clb.org', 'china-bid.com', 'cec.gov',
+              'zbycg.com', 'skxox.', 'ylqxzb.com', 'hc360.com', 'buildnet.cn', 'hebpi.com', 'chn0769.com',
+              '591237.com', 'chemcp.com', 'cnelc.com', 'cncylinder.com']  # 商业站点黑名单支持模糊 会合并成正则进行过滤
+
+RE_EM = re.compile(r'<em[^>]*>(.*?)</em>')  # 提取搜索引擎标红关键词
+RE_BASE_URL = re.compile(r'''(?:base(?:&quot;|\s){1,3}href(?:&quot;|\s)?=(?:&quot;|\s)?(["'])([\s\S]{5,1000}?)\1)|(?:base(?:&quot;|\s){1,3}href(?:&quot;|\s)?=(?:&quot;|\s)?([\s\S]{5,1000}?)(?:&quot;| ))''', flags=re.I)
+RE_ORIGIN_URL = re.compile(r'''URL='(.*?)'"''')
+ip_list = ['220.181.57.215', '123.125.115.96', '111.13.101.82', 'cache.baiducontent.com']
+
+def get_cache_ip():
+    """获取百度快照ip"""
+    global ip_list
+
+    ip = ip_list.pop(0)
+    ip_list.append(ip)
+    return ip
+
+
+def clean_title(title):
+    """简单去除百度标题杂质"""
+
+    simple_title = Itool.get_str_left(title, '-', out=True)
+    simple_title = Itool.get_str_left(simple_title, '_', out=True)
+    simple_title = simple_title.replace('.', '').strip()
+
+    return simple_title
+
+
+def extract_em(content):
+    """传入字符串 提取em 标红关键词"""
+    em_list = RE_EM.findall(content)
+    em_title = ''.join(em_list)
+    return em_title
+
+
+def compare_len(first, second, rate=0.5):
+    """传入两个字符串 比较两者之间的长度是否相差指定比例
+        低于指定比例返回True  否则返回 False"""
+
+    if not isinstance(first, str) or not isinstance(second, str):
+        return False
+    first_len = len(first)
+    second_len = len(second)
+    if not second_len or not first_len:
+        return False
+
+    p = first_len / second_len
+    if p > 1:
+        p = 1.0 / p
+    if p <= rate:
+        return False
+    else:
+        return True
+
+
+def update_dict(data, update_data):
+    """
+    传入两个dict 更新后返回
+    :param data:
+    :param update_data:
+    :return:
+    """
+
+    data.update(update_data)
+    return data
+
+
+class UrlToIp(object):
+
+    def __init__(self):
+        db_engine = create_engine(os.getenv("DATACACHE01"))
+        self.Session_DATACACHE01 = sessionmaker(bind=db_engine)
+        self.keyword_list = []  # 查询标题列表
+        self._wait = False
+        self._quit = False
+        self.result_lst = []
+        self.tables_name = 'black_domain_list_ip_addr'
+
+    def select_data(self):
+        """从数据库查询数据"""
+
+        select_sql = r"""SELECT
+                       record_pk,
+                       `domain`
+                       FROM
+                       {}
+                       WHERE
+                           status=0 
+                       limit 50
+                       for update""".format(self.tables_name)
+
+        update_sql = r"""update {} set status=2 where record_pk in {}"""
+
+        try:
+            Masterdb01 = self.Session_DATACACHE01()
+
+            ret = Masterdb01.execute(select_sql).fetchall()  #
+            if not ret:
+                # 未查询到 所有数据处理完成
+                self._wait = True
+                Masterdb01.commit()
+                is_ok = True
+                return is_ok
+            self._wait = False
+            record_list = []
+            for record_pk, domain in ret:
+                self.keyword_list.append({'record_pk': record_pk,
+                                          'domain': domain,
+                                          })
+                record_list.append(str(record_pk))
+            record = '(' + ','.join(record_list) + ')'
+            update_sql = update_sql.format(self.tables_name, record)
+            Masterdb01.execute(update_sql)
+            Masterdb01.commit()
+            is_ok = True
+        except Exception as e:
+            self.err = str(e)
+            Masterdb01.rollback()
+            if raven_client:
+                raven_client.captureException()
+
+            is_ok = False
+        finally:
+            Masterdb01.close()
+
+        return is_ok
+
+    def get_keyword(self):
+        """获取关键词并查询"""
+        if not self.keyword_list:
+            self.select_data()
+        if self._wait:
+            return None
+        data = self.keyword_list.pop()
+        return data
+
+    def deal_url(self, data):
+
+        url = data.get('domain')
+        record_pk = data.get('record_pk')
+
+        host, port = url_to_ip(url)
+        if host:
+            status = '1'
+        else:
+            status = '3'
+        self.result_lst.append({
+            'domain': url,
+            'host': host,
+            'port': port,
+            'record_pk': record_pk,
+            'status': status
+
+        })
+
+    def on_work(self):
+
+        try:
+            data = self.get_keyword()
+            if not data:
+                if self._wait:
+                    # time.sleep(10 * 60)  # 未获取到数据10分钟后再进行查询
+                    self._quit = True  # 强制退出
+                else:
+                    time.sleep(1 * 60)  # 可能是数据库连接查询问题 等待1分钟后尝试
+                return
+            self.deal_url(data)
+
+            # self.data_commit()  # 查询之前先检测是否需要入库
+
+        except Exception as e:
+            self.err = str(e)
+            time.sleep(10)
+            if raven_client:
+                raven_client.captureException()
+
+    def data_commit(self):
+        """修改爬取数据状态"""
+
+        update_sql = r'''update {} set status={}, port='{}', ip_host='{}' where record_pk = {}'''
+
+        try:
+            Masterdb01 = self.Session_DATACACHE01()
+
+
+            if self.result_lst:
+
+                for each in self.result_lst:
+                    Masterdb01.execute(update_sql.format(self.tables_name,
+                                                         each.get('status'),
+                                                         each.get('port'),
+                                                         each.get('host'),
+                                                         each.get('record_pk')))
+            Masterdb01.commit()
+
+            self.result_lst = []
+            is_ok = True
+        except Exception as e:
+            self.err = str(e)
+            Masterdb01.rollback()
+            if raven_client:
+                raven_client.captureException()
+
+            is_ok = False
+        finally:
+            Masterdb01.close()
+
+        return is_ok
+
+    def run(self, table_name='bulletin_domain_list_ip_addr'):
+        self.tables_name = table_name
+        n = 0
+        while not self._quit:
+            self.on_work()
+            n += 1
+            if n >= 10:
+                print(Itool.get_time_str() + '插入数据')
+                self.data_commit()
+                n = 0
+        self.data_commit()
+
+
+class UrlCrawler(object):
+
+    def __init__(self):
+        db_engine = create_engine(os.getenv("DATACACHE01"))
+        self.Session_DATACACHE01 = sessionmaker(bind=db_engine)
+        self.keyword_list = []  # 查询标题列表
+        self._wait = False
+        self._quit = False
+        self.succeed_record = []
+        self.faild_record = []
+        self.result_lst = []
+        self.RE_BLACK = re.compile('|'.join(black_list))
+        # self.init_black()
+
+    def crawler(self, url):
+        """
+        抓取指定网址首页
+        :param url:
+        :return:
+        """
+
+        r = request(url=url, timeout=30)
+        if not r:
+            return ''
+
+        return r.text
+
+    def sogou_crawler_snapshotorigin(self, keyword):
+
+
+        headers = {'Host': 'snapshot.sogoucdn.com',
+                   'Connection': 'keep-alive',
+                   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                   'Upgrade-Insecure-Requests': '1',
+                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36',
+                   'Accept-Encoding': 'gzip, deflate, sdch',
+                   'Accept-Language': 'zh-CN,zh;q=0.8'}
+
+        keyword = quote(keyword, safe='') + '%2F'
+        url = 'http://snapshot.sogoucdn.com/pcsnapshotorigin?url={}&query=sogou&tabMode=1&noTrans=0'.format(keyword)
+        result = ''
+        r = request(url, verify=False, headers=headers)
+        if not r:
+            # 访问失败 直接返回
+            return result
+
+        return r.text
+
+    def sogou_crawler_url(self, keyword):
+        """
+        抓取搜狗
+        :param keyword:
+        :return:
+        """
+        headers = {'Host': 'www.sogou.com',
+                   'Connection': 'keep-alive',
+                   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                   'Upgrade-Insecure-Requests': '1',
+                   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36',
+                   'Accept-Encoding': 'gzip, deflate, sdch',
+                   'Accept-Language': 'zh-CN,zh;q=0.8'}
+        cookies = {'com_sohu_websearch_ITEM_PER_PAGE': '100'}
+        url = 'https://www.sogou.com/web?sitequery=&num=100&query={}'.format(keyword)
+        result = []
+        r = request(url, verify=False, headers=headers, cookies=cookies)
+        if not r:
+            # 访问失败 直接返回
+            return result
+        ret_list = re.findall(r'<h3[^>]{1,20}>[\s\S]{500,3000}?>快照<', r.text)  # 获取所有存在快照信息的网址 然后在细化清洗
+        for data in ret_list:
+
+            data_url = ''
+            status = re.search(r'href="[\s\S]{5,500}?">(.*?)</a>', data)
+            if status:
+
+                title = status.groups(0)[0]
+                em_title = extract_em(title)
+                # em_title = Itool.tag_filter(em_title)
+                title = Itool.tag_filter(title)
+                title = Itool.get_str_left(title, '_【', out=True)
+                title = Itool.get_str_left(title, '_', out=True)
+            else:
+                title = ''
+                # em_title = ''
+
+            status = re.search(r'''href="(http://snapshot[\s\S]{10,1000}?)"''', data)
+            if status:
+                snapshot_url = status.groups(0)[0]
+
+
+            else:
+                snapshot_url = ''
+
+            # digest = Itool.get_str_mid(data, '<p class="str_info">', '</p>')
+            # digest_keyword = extract_em(digest)
+            # digest = Itool.tag_filter(digest)
+
+
+            if not data_url:
+                snapshot = unquote(snapshot_url)
+                data_url = Itool.get_str_mid(snapshot, 'url=', ';').replace('&amp', '')
+            if not data_url:
+                data_url = Itool.get_str_mid(snapshot, 'url=', '&').replace('&amp', '').replace(';', '')
+            if data_url[-1] == '/':
+                data_url = data_url[0:-1]
+            if title and data_url and data_url == keyword:
+                snapshot = snapshot.replace('&amp;', '&')
+                result.append((data_url, snapshot))
+        return result
+
+    def select_data(self):
+        """从数据库查询数据"""
+
+        select_sql = r"""SELECT
+                       record_pk,
+                       `domain`
+                       FROM
+                       bulletin_search_domain_list
+                       WHERE
+                           status=0 
+                       limit 50
+                       for update"""
+
+        update_sql = r"""update bulletin_search_domain_list set status=2 where record_pk in {}"""
+
+        try:
+            Masterdb01 = self.Session_DATACACHE01()
+
+            ret = Masterdb01.execute(select_sql).fetchall()  #
+            if not ret:
+                # 未查询到 所有数据处理完成
+                self._wait = True
+                Masterdb01.commit()
+                is_ok = True
+                return is_ok
+            self._wait = False
+            record_list = []
+            for record_pk, domain in ret:
+                self.keyword_list.append({'record_pk': record_pk,
+                                          'domain': domain,
+                                          })
+                record_list.append(str(record_pk))
+            record = '(' + ','.join(record_list) + ')'
+            update_sql = update_sql.format(record)
+            Masterdb01.execute(update_sql)
+            Masterdb01.commit()
+            is_ok = True
+        except Exception as e:
+            self.err = str(e)
+            Masterdb01.rollback()
+            if raven_client:
+                raven_client.captureException()
+
+            is_ok = False
+        finally:
+            Masterdb01.close()
+
+        return is_ok
+
+    def get_keyword(self):
+        """获取关键词并查询"""
+        if not self.keyword_list:
+            self.select_data()
+        if self._wait:
+            return None
+        data = self.keyword_list.pop()
+        return data
+
+    def check_url(self, url):
+        """
+        传入url 判断是招投标站点的概率
+        :param url: str
+        :return: float
+        """
+        content = self.sogou_crawler_snapshotorigin(url)
+        if not content:
+            content = self.crawler(url)
+
+        if not content:
+            return 0
+
+        status = RE_MUST_URL.search(url)
+        sim = 0
+        if status:
+            # 网址中包含 edu  gov 默认就是为招投标站点
+            sim = 0.3
+        if re.search(r'//bbs\.', url):
+            sim -= 0.3
+        meta_content = content[0:1500]  # 取前1500位 初步判断
+        ret = RE_META_FILTER.findall(meta_content)
+        sim += -0.2 * len(ret)
+
+        ret = RE_META_MUST_KEYWORD.findall(meta_content)  # 出现可疑关键词
+        sim += 0.03 * len(ret)
+
+        status = RE_TITLE.search(meta_content)
+        if status:
+            title = status.groups(0)[0]
+            title = Itool.tag_filter(title)
+        else:
+            title = ''
+        if title and RE_META_TITLE_c.search(title):
+            # 标题中存在 学院|医院|政府采购
+            sim += 0.2
+
+        url_lst = RE_CHECK_URL.findall(content)
+        m = 0
+        s = 0
+        for each in url_lst:
+            # 遍历所有的超链接 标题长度大于4的  是否包含指定关键词
+            title = each[2]
+            title = Itool.tag_filter(title)
+            if len(title) <= 5:
+                continue
+
+            s += 1
+
+            if RE_MUST_TITLE.search(title):
+                # 清洗的招投标中包含 招投标关键词
+                m += 1
+        rate = 0
+        if s >= 5:
+            rate = m / s
+            if rate > 0.5:
+                rate = 0.5
+
+        sim += rate * 0.5
+        if m < 10 and rate > 0.1:
+            sim += 0.05 * m
+        elif rate > 0.1:
+            sim += 0.15
+
+        if RE_CONTENT_KEYWORD.search(content):
+            sim += 0.1
+
+        last_content = content[-3000: -1]
+        if RE_LAST_KEYWORD.search(last_content):
+            # 政府站点
+            sim += 0.2
+
+        if sim > 1:
+            sim = 1
+        # elif sim < 0.2:
+        #     sim = 0.0
+
+        return sim
+
+    def deal_url(self, data):
+
+        url = data.get('domain')
+        record_pk = data.get('record_pk')
+
+        sim = self.check_url(url)
+        if sim <= 0:
+            self.faild_record.append(str(record_pk))
+        else:
+            self.succeed_record.append(str(record_pk))
+
+        self.result_lst.append({
+            'domain': url,
+            'sim': sim,
+            'record_pk': record_pk,
+        })
+
+    def on_work(self):
+
+        try:
+            data = self.get_keyword()
+            # if not data:
+            #     if self._wait:
+            #         time.sleep(10 * 60)  # 未获取到数据10分钟后再进行查询
+            #         self._quit = True  # 强制退出
+            #     else:
+            #         time.sleep(1 * 60)  # 可能是数据库连接查询问题 等待1分钟后尝试
+            #     return
+            if not data:
+                return
+            self.deal_url(data)
+
+            # self.data_commit()  # 查询之前先检测是否需要入库
+
+        except Exception as e:
+            self.err = str(e)
+            time.sleep(10)
+            if raven_client:
+                raven_client.captureException()
+        return True
+
+    def data_commit(self):
+        """修改爬取数据状态"""
+
+        succeed_sql = r"""update bulletin_search_domain_list set status=1 where record_pk in {}"""
+        faild_sql = r"""update bulletin_search_domain_list set status=4 where record_pk in {}"""
+
+        try:
+            Masterdb01 = self.Session_DATACACHE01()
+            if self.succeed_record:
+                succeed_sql = succeed_sql.format('(' + ','.join(self.succeed_record) + ')')
+                Masterdb01.execute(succeed_sql)
+
+            if self.faild_record:
+                faild_sql = faild_sql.format('(' + ','.join(self.faild_record) + ')')
+                Masterdb01.execute(faild_sql)
+
+            if self.result_lst:
+                Masterdb01.execute(
+                    BulletinSearchDomainResult.__table__.insert().prefix_with('IGNORE'), self.result_lst)
+            Masterdb01.commit()
+            self.succeed_record = []
+            self.faild_record = []
+            self.result_lst = []
+            is_ok = True
+        except Exception as e:
+            self.err = str(e)
+            Masterdb01.rollback()
+            if raven_client:
+                raven_client.captureException()
+
+            is_ok = False
+        finally:
+            Masterdb01.close()
+
+        return is_ok
+
+    def run(self):
+        n = 0
+        while not self._quit:
+            status = self.on_work()
+            n += 1
+            if n >= 50:
+                print(Itool.get_time_str() + '插入数据')
+                self.data_commit()
+                n = 0
+            if not status:
+                break
+        self.data_commit()
+
+
+def run():
+    UrlCrawler().run()
+
+
+def run_get_ip(table_name):
+    UrlToIp().run(table_name=table_name)
+
+
+def thread_run_get_ip(count=5, table_name='bulletin_domain_list_ip_addr'):
+    run_lst = []
+    for _ in range(count):
+        work = threading.Thread(target=run_get_ip, args=(table_name, ))
+        work.start()
+        run_lst.append(work)
+
+    for each in run_lst:
+        each.join()
+
+
+def thread_run(count=3):
+    run_lst = []
+    for _ in range(count):
+        work = threading.Thread(target=run)
+        work.start()
+        run_lst.append(work)
+
+    for each in run_lst:
+        each.join()
+
+
+if __name__ == '__main__':
+
+    thread_run(count=1)
+    # print(UrlCrawler().check_url('http://www.changning.sh.cn'))
+    # print(url_to_ip('http://www.smzfcg.gov.cn:8090'))
+    # print(ip_to_host('222.66.103.87'))
+    # run_get_ip()
+    # thread_run_get_ip(count=10, table_name='black_domain_list_ip_addr')
